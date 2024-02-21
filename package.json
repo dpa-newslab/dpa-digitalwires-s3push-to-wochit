@@ -1,0 +1,22 @@
+{
+  "name": "dpa-s3push-to-wochit",
+  "version": "1.0.0",
+  "description": "Sample project to automatically process dpa articles received via s3push-API. New or updated dpa articles are directly transfered to the S3-Bucket you own, converted from the dpa-digitalwires JSON to wochit-API-format and are sent to the wochit-API.",
+  "author": "dpa-IT Services GmbH",
+  "license": "Apache-2.0",
+  "licenses": [
+    {
+      "type": "Apache-2.0",
+      "url": "http://www.apache.org/licenses/LICENSE-2.0"
+    }
+  ],
+  "scripts": {
+    "test": "pytest -s test",
+    "s3push-deploy": "serverless deploy; serverless info --verbose",
+    "s3push-remove": "serverless remove"
+  },
+  "devDependencies": {
+    "serverless": "^3.38.0",
+    "serverless-python-requirements": "^6.0.1"
+  }
+}

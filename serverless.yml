@@ -1,0 +1,269 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright 2024 dpa-IT Services GmbH
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+service: ${self:custom.global_resource_prefix}-${self:custom.component_name}
+
+plugins: 
+  - serverless-python-requirements 
+
+custom:
+  component_name: dpa-s3push-send-to-wochit  # CHANGE THIS!
+  global_resource_prefix: abcde  # CHANGE THIS!
+
+  description: "Setup S3 bucket to receive dpa content and send it to the wochit-API"
+
+  ####
+  #### Please set bucket name and prefix (IMPORTANT: lowercase only, no leading and trailing slashes)
+  ####
+  s3_bucket_name: ${self:custom.global_resource_prefix}-dpa-s3push-incoming-wochit # CHANGE THIS!
+  s3_prefix_in: prefix # CHANGE THIS!
+  s3_prefix_associations: associations 
+
+  sns_s3push_incoming_topic_name: ${self:custom.global_resource_prefix}-dpa-s3push-incoming-wochit-sns
+
+  sqs_incoming_name: ${self:custom.global_resource_prefix}-s3push-incoming-wochit-sqs  # CHANGE THIS!
+
+  ssm_wochit_api_key: /dpa_import/wochit_api_key
+  ssm_wochit_client_id: /dpa_import/wochit_client_id
+  ssm_wochit_client_secret: /dpa_import/wochit_client_secret
+
+  pythonRequirements:
+    usePipenv: false
+
+provider:
+  name: aws
+  runtime: python3.10
+  stage: ${opt:stage, 'dev'}  # CHANGE THIS!
+  region: eu-central-1
+  # TODO: create deployment bucket or comment the deploymentBucket with results in a default deployment bucket
+  # aws s3api create-bucket --bucket <deploymentBucketName> --region eu-central-1 --create-bucket-configuration LocationConstraint=eu-central-1
+  deploymentBucket: serverless-deployments-eu-central-1 # serverless-deployments-${self:provider.region}-${env:USER,"someUser"}  # CHANGE THIS!
+  logRetentionInDays: 14
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - "s3:GetObject"
+      Resource:
+        - "arn:aws:s3:::${self:custom.s3_bucket_name}/${self:custom.s3_prefix_in}/*"
+    - Effect: "Allow"
+      Action:
+        - "s3:PutObject"
+      Resource:
+        - "arn:aws:s3:::${self:custom.s3_bucket_name}/${self:custom.s3_prefix_associations}/*"
+    - Effect: "Allow"
+      Action: 
+        - "ssm:GetParameter"
+      Resource:
+        - "arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter${self:custom.ssm_wochit_api_key}"
+        - "arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter${self:custom.ssm_wochit_client_id}"
+        - "arn:aws:ssm:${self:provider.region}:${aws:accountId}:parameter${self:custom.ssm_wochit_client_secret}"
+
+
+functions:
+  sendToWochit:
+    handler: handler.handle
+    description: "Send digitalwires entries to the wochit-API"
+    memorySize: 256
+    timeout: 120
+    events:
+      - sqs:
+          arn: {"Fn::GetAtt": ["S3PushIncomingQueue", "Arn"]}
+          batchSize: 1
+    environment:
+      S3_BUCKET_NAME: ${self:custom.s3_bucket_name}
+      S3_BUCKET_PREFIX_ASSOCIATIONS: ${self:custom.s3_prefix_associations}
+      SSM_WOCHIT_API_KEY: ${self:custom.ssm_wochit_api_key}
+      SSM_WOCHIT_CLIENT_ID: ${self:custom.ssm_wochit_client_id}
+      SSM_WOCHIT_CLIENT_SECRET: ${self:custom.ssm_wochit_client_secret}
+
+resources:
+  Description: "${self:custom.description}"
+  Resources:
+    # Users
+    S3PushAccessKey:
+      Type: AWS::IAM::AccessKey
+      Properties:
+        UserName: {"Ref": "S3PushUser"}
+    S3PushUser:
+      Type: AWS::IAM::User
+      Properties:
+        Path: "/"
+        Policies:
+        - PolicyName: S3PushUserAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: "Allow"
+              Action:
+                - "s3:GetObject"
+                - "s3:PutObject"
+              Resource: "arn:aws:s3:::${self:custom.s3_bucket_name}/${self:custom.s3_prefix_in}/*"
+            - Effect: "Allow"
+              Action:
+                - "s3:GetBucketLocation"
+              Resource: "arn:aws:s3:::${self:custom.s3_bucket_name}"
+            - Effect: "Allow"
+              Action: "s3:ListBucket"
+              Condition: 
+                StringLike: 
+                  "s3:prefix": "${self:custom.s3_prefix_in}/*"
+              Resource: "arn:aws:s3:::${self:custom.s3_bucket_name}"
+
+    # bucket
+    S3PushBucket:
+      Type: AWS::S3::Bucket
+      DependsOn:
+        - S3PushIncomingTopic
+        - S3PushIncomingTopicPolicy
+      Properties:
+        BucketName: ${self:custom.s3_bucket_name}
+        AccessControl: Private
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          IgnorePublicAcls: true
+          BlockPublicPolicy: false
+          RestrictPublicBuckets: false
+        VersioningConfiguration:
+          Status: Enabled
+        LifecycleConfiguration:
+          Rules:
+            - Id: delete-incoming-after-30-days 
+              ExpirationInDays: 30
+              Prefix: ${self:custom.s3_prefix_in}/
+              Status: Enabled
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - '*'
+              AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - HEAD
+              MaxAge: 3000
+        NotificationConfiguration:
+          TopicConfigurations:
+            - Event: s3:ObjectCreated:*
+              Filter:
+                S3Key:
+                  Rules:
+                    - Name: Prefix
+                      Value: "${self:custom.s3_prefix_in}"
+                    - Name: Suffix
+                      Value: .json
+              Topic:
+                Ref: S3PushIncomingTopic
+
+    S3PushBucketPolicy:
+      Type: AWS::S3::BucketPolicy 
+      DependsOn:
+        - S3PushBucket
+      Properties:
+        Bucket: 
+          Ref: S3PushBucket
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: AllowAssociationsGet
+              Effect: Allow 
+              Action: 
+                - s3:GetObject 
+              Resource: 
+                - arn:aws:s3:::${self:custom.s3_bucket_name}/${self:custom.s3_prefix_associations}/*
+              Principal: "*"
+
+    # topic for incoming dpa content (.json)
+    S3PushIncomingTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:custom.sns_s3push_incoming_topic_name}
+
+    S3PushIncomingTopicPolicy:
+      Type: AWS::SNS::TopicPolicy
+      Properties:
+        Topics:
+        - Ref: S3PushIncomingTopic
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: AllowS3PushBucketToPublishToQueue
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource:
+              Ref: S3PushIncomingTopic
+            Condition:
+              ArnLike:
+                "aws:SourceArn": "arn:aws:s3:*:*:${self:custom.s3_bucket_name}"
+
+    # read this queue to get a stream of incoming articles 
+    S3PushIncomingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        DelaySeconds: 0
+        MaximumMessageSize: 262144
+        MessageRetentionPeriod: 864000
+        QueueName: ${self:custom.sqs_incoming_name}
+        ReceiveMessageWaitTimeSeconds: 0
+        VisibilityTimeout: 90
+        #RedrivePolicy:
+        #  deadLetterTargetArn: !GetAtt FailureQueue.Arn
+        #  maxReceiveCount: 10
+
+    SnsToSqsIncomingSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: {"Fn::Join": ["", ["arn:aws:sns:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":${self:custom.sns_s3push_incoming_topic_name}"]]}
+        Endpoint: 
+          Fn::GetAtt: [S3PushIncomingQueue, Arn]
+        Protocol: sqs
+        RawMessageDelivery: true
+
+    # Policy allows SNS to publish to this SQS queue
+    IncomingSnsToSqsPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: "Allow SNS publish to SQS"
+              Effect: Allow
+              Principal: 
+                Service: "sns.amazonaws.com"
+              Resource: {"Fn::Join": ["", ["arn:aws:sqs:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":${self:custom.sqs_incoming_name}"]]}
+              Action: SQS:SendMessage
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: {"Fn::Join": ["", ["arn:aws:sns:", {"Ref": "AWS::Region"}, ":", {"Ref": "AWS::AccountId"}, ":${self:custom.sns_s3push_incoming_topic_name}"]]}
+        Queues:
+          - Ref: S3PushIncomingQueue
+
+  Outputs:
+    S3PushUrlPrefix:
+      Value: {"Fn::Join": ["", ["s3://", { "Ref" : "S3PushBucket" }, "/${self:custom.s3_prefix_in}"]]}
+    S3PushAccessKeyId:
+      Value: {"Ref": "S3PushAccessKey"}
+    S3PushSecretAccessKey:
+      Value: {"Fn::GetAtt": [ "S3PushAccessKey", "SecretAccessKey" ] }
+    S3PushDeliveryQueueUrl:
+      Value: {"Ref": "S3PushIncomingQueue"}
+
+package:
+  patterns:
+    - "!./**"
+    - "utils/**"
+    - "handler.py"
